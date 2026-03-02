@@ -1,0 +1,33 @@
+{
+  "name": "openclaw-guard-plugin",
+  "version": "0.1.0",
+  "description": "Workspace file protection plugin for OpenClaw — guards against prompt injection attacks that attempt to read or modify critical agent identity and memory files.",
+  "type": "module",
+  "main": "index.js",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "security",
+    "prompt-injection",
+    "workspace-guard",
+    "agent-safety"
+  ],
+  "author": "merlin <limenglin5911@gmail.com> (https://github.com/lml2468)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lml2468/openclaw-guard-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lml2468/openclaw-guard-plugin/issues"
+  },
+  "homepage": "https://github.com/lml2468/openclaw-guard-plugin#readme",
+  "dependencies": {
+    "minimatch": "^10.0.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "workspace-guard"
+    ]
+  }
+}

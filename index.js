@@ -237,34 +237,18 @@ export function register(api) {
 
     // --- APPLY_PATCH ---
     if (toolName === "apply_patch") {
-      const patchContent =
-        event.params?.patch || event.params?.diff || event.params?.content || "";
-      if (typeof patchContent === "string") {
-        const fileRefs = patchContent.match(/^[+-]{3}\s+[ab]\/(.+)$/gm) || [];
-        for (const ref of fileRefs) {
-          const match = ref.match(/^[+-]{3}\s+[ab]\/(.+)$/);
-          if (match) {
-            const patchFile = match[1].trim();
-            const { absolutePath: absPatchPath } = resolveAbsoluteWithRoots(
-              patchFile,
-              workspaceRoots,
-            );
-            if (
-              absPatchPath &&
-              isProtectedFile(absPatchPath, workspaceRoots, protectedFiles)
-            ) {
-              api.logger.warn?.(
-                `[workspace-guard] BLOCKED apply_patch targeting protected file: ${patchFile} (session: ${ctx.sessionKey})`,
-              );
-              return {
-                block: true,
-                blockReason: `🛡️ Protected file — cannot patch "${patchFile}" in group chat context.`,
-              };
-            }
-          }
-        }
-      }
-      return;
+      // apply_patch embeds file paths inside patch content — we cannot reliably
+      // redirect paths without rewriting the patch format. Block entirely in
+      // external sessions. The AI should use write/edit instead (which get
+      // automatically redirected to the sandbox directory).
+      api.logger.warn?.(
+        `[workspace-guard] BLOCKED apply_patch in external session (session: ${ctx.sessionKey})`,
+      );
+      return {
+        block: true,
+        blockReason:
+          "🛡️ apply_patch is not available in external sessions. Use write or edit instead — files will be saved to the sandbox directory.",
+      };
     }
   });
 }

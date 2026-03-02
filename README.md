@@ -93,7 +93,7 @@ The plugin inspects the `sessionKey` from the tool call context. Only sessions e
 | `read` | 🛡️ Blocked | ✅ Allowed |
 | `write` | 🛡️ Blocked | ↪️ Redirected to sandbox |
 | `edit` | 🛡️ Blocked | ↪️ Redirected to sandbox |
-| `apply_patch` | 🛡️ Blocked | ✅ Allowed |
+| `apply_patch` | 🛡️ Blocked | 🛡️ Blocked (use write/edit instead) |
 
 ### Write Redirection
 

@@ -1,9 +1,12 @@
 {
   "name": "openclaw-guard-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Workspace file protection plugin for OpenClaw — guards against prompt injection attacks that attempt to read or modify critical agent identity and memory files.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "vitest run"
+  },
   "keywords": [
     "openclaw",
     "openclaw-plugin",
@@ -27,7 +30,10 @@
   },
   "openclaw": {
     "extensions": [
-      "workspace-guard"
+      "./index.js"
     ]
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
   }
 }

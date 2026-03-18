@@ -1,7 +1,10 @@
 import path from "node:path";
 import { minimatch } from "minimatch";
 
-// Default protected files — always blocked for read/write/edit in group sessions
+// =============================================================================
+// Defaults
+// =============================================================================
+
 const DEFAULT_PROTECTED_FILES = [
   "SOUL.md",
   "AGENTS.md",
@@ -13,9 +16,83 @@ const DEFAULT_PROTECTED_FILES = [
   "memory/*.md",
 ];
 
+const DEFAULT_TRUSTED_PATTERNS = ["*:main"];
+
+// Tools unconditionally allowed in untrusted sessions (no file/workspace access)
+const DEFAULT_UNTRUSTED_ALLOWED_TOOLS = [
+  "web_search",
+  "web_fetch",
+  "tts",
+  "message",
+];
+
+// FS tools needing parameter-level guards
+const FILE_READ_TOOLS = new Set(["read"]);
+const FILE_WRITE_TOOLS = new Set(["write", "edit"]);
+
+// Tools that implicitly access workspace files without inspectable path params
+const IMPLICIT_FILE_TOOLS = new Set([
+  "memory_search",
+  "memory_get",
+  "apply_patch",
+]);
+
+// Protected file base names for exec command scanning
+const DEFAULT_PROTECTED_LITERALS = [
+  "SOUL.md",
+  "AGENTS.md",
+  "USER.md",
+  "IDENTITY.md",
+  "MEMORY.md",
+  "TOOLS.md",
+  "HEARTBEAT.md",
+];
+
+// Best-effort heuristic patterns for exec commands targeting .md files.
+// NOT a security boundary — determined attackers can bypass these trivially.
+const SUSPICIOUS_EXEC_PATTERNS = [
+  /\b(?:cat|head|tail|less|more|bat)\b.*\.md\b/i,
+  /\b(?:sed|awk)\b.*\.md\b/i,
+  /\btee\b.*\.md\b/i,
+  /\b(?:cp|mv|rm)\b.*\.md\b/i,
+  />\s*\S*\.md\b/,
+];
+
+// =============================================================================
+// Trust Model
+// =============================================================================
+
 /**
- * Collect all agent workspace directories from config.
+ * Determine trust level of a session.
+ *
+ * - "owner":     main session — unrestricted
+ * - "trusted":   explicitly trusted patterns — file guards only, other tools allowed
+ * - "untrusted": everything else — default-deny, whitelist only
+ *
+ * Thread suffixes (::thread:<id>) are stripped so threads inherit parent trust.
  */
+function getTrustLevel(sessionKey, trustedPatterns) {
+  if (!sessionKey || typeof sessionKey !== "string") return "untrusted";
+  const base = sessionKey.replace(/::thread:[^:]+$/, "");
+
+  for (const pattern of trustedPatterns) {
+    if (minimatch(base, pattern, { dot: true })) {
+      // Default *:main → owner; other explicit patterns → trusted
+      if (pattern === "*:main" && base.endsWith(":main")) return "owner";
+      return "trusted";
+    }
+  }
+  return "untrusted";
+}
+
+// =============================================================================
+// File Path Utilities
+// =============================================================================
+
+function resolveFilePath(params) {
+  return params?.file_path || params?.filePath || params?.path || params?.file || null;
+}
+
 function collectWorkspaceRoots(config) {
   const roots = new Set();
   const defaultWorkspace =
@@ -26,121 +103,58 @@ function collectWorkspaceRoots(config) {
   const agents = config?.agents?.list;
   if (Array.isArray(agents)) {
     for (const agent of agents) {
-      if (agent?.workspace) {
-        roots.add(path.resolve(agent.workspace));
-      }
-      // Also check agentDir — some agents store identity files there
-      if (agent?.agentDir) {
-        roots.add(path.resolve(agent.agentDir));
-      }
+      if (agent?.workspace) roots.add(path.resolve(agent.workspace));
+      if (agent?.agentDir) roots.add(path.resolve(agent.agentDir));
     }
   }
   return [...roots];
 }
 
-/**
- * Check if a session should be protected (non-main session).
- *
- * Only the main session (direct chat with owner via primary interface)
- * is trusted. ALL external channel sessions are protected, whether
- * DM or group — because any external message could be prompt injection.
- *
- * Session key formats:
- *   - Main:     agent:main:main  (trusted, owner direct chat)
- *   - External: agent:main:dmwork:direct:<id>  (protected)
- *   - Group:    agent:main:<channel>:group:<id> (protected)
- *   - Channel:  agent:main:<channel>:channel:<id> (protected)
- *   - Thread:   ...::thread:<id>  (inherits parent context)
- */
-function isProtectedSession(sessionKey) {
-  if (!sessionKey || typeof sessionKey !== "string") return true; // default: protect
-  const base = sessionKey.replace(/::thread:[^:]+$/, "");
-  // Only main sessions are trusted
-  return !base.endsWith(":main");
-}
-
-/**
- * Resolve the file path from tool params.
- * Tools use different param names: path, file_path, filePath
- */
-function resolveFilePath(params) {
-  return (
-    params?.file_path || params?.filePath || params?.path || params?.file || null
-  );
-}
-
-/**
- * Check if a resolved absolute path falls within any protected pattern
- * relative to any of the workspace roots.
- */
 function isProtectedFile(absolutePath, workspaceRoots, patterns) {
   if (!absolutePath) return false;
   const resolved = path.resolve(absolutePath);
   for (const root of workspaceRoots) {
     const relative = path.relative(root, resolved);
-    // Skip if path escapes this workspace
     if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
-    if (patterns.some((pattern) => minimatch(relative, pattern, { dot: true }))) {
-      return true;
-    }
+    if (patterns.some((p) => minimatch(relative, p, { dot: true }))) return true;
   }
   return false;
 }
 
-/**
- * Resolve the absolute path of a file, trying each workspace root.
- * Returns the first workspace root that makes sense for this path.
- */
-function resolveAbsoluteWithRoots(filePath, workspaceRoots) {
+function resolveAbsolute(filePath, workspaceRoots) {
   if (!filePath) return { absolutePath: null, root: null };
-  // If already absolute, use as-is
   if (path.isAbsolute(filePath)) {
     const resolved = path.resolve(filePath);
-    // Find which workspace root it belongs to
     for (const root of workspaceRoots) {
-      const relative = path.relative(root, resolved);
-      if (!relative.startsWith("..") && !path.isAbsolute(relative)) {
+      const rel = path.relative(root, resolved);
+      if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
         return { absolutePath: resolved, root };
       }
     }
     return { absolutePath: resolved, root: workspaceRoots[0] };
   }
-  // Relative path — resolve against first (default) workspace
   return {
     absolutePath: path.resolve(workspaceRoots[0], filePath),
     root: workspaceRoots[0],
   };
 }
 
-/**
- * Check if a path is inside (or equal to) a directory.
- */
 function isPathInside(filePath, dir) {
   const resolved = path.resolve(filePath);
   const resolvedDir = path.resolve(dir);
   return resolved === resolvedDir || resolved.startsWith(resolvedDir + path.sep);
 }
 
-/**
- * Redirect a write/edit path to the allowed base directory.
- * Preserves the relative structure from the workspace root.
- */
-function redirectPath(absolutePath, workspaceRoot, allowedBaseDir) {
+function redirectPath(absolutePath, workspaceRoot, sandboxDir) {
   const resolved = path.resolve(absolutePath);
-  // If already inside allowedBaseDir, no redirect needed
-  if (isPathInside(resolved, allowedBaseDir)) return null;
-  // Try to keep relative structure from workspace root
+  if (isPathInside(resolved, sandboxDir)) return null;
   const relative = path.relative(workspaceRoot, resolved);
   if (!relative.startsWith("..") && !path.isAbsolute(relative)) {
-    return path.join(allowedBaseDir, relative);
+    return path.join(sandboxDir, relative);
   }
-  // Outside workspace: just use the basename
-  return path.join(allowedBaseDir, path.basename(resolved));
+  return path.join(sandboxDir, path.basename(resolved));
 }
 
-/**
- * Rewrite params to use the redirected path.
- */
 function rewriteParams(params, newPath) {
   const updated = { ...params };
   if (params?.file_path != null) updated.file_path = newPath;
@@ -150,105 +164,257 @@ function rewriteParams(params, newPath) {
   return updated;
 }
 
-// FS tools that we intercept
-const READ_TOOLS = new Set(["read"]);
-const WRITE_TOOLS = new Set(["write", "edit"]);
+// =============================================================================
+// Guard Functions
+// =============================================================================
 
-export function register(api) {
-  const pluginConfig = api.pluginConfig || {};
-  const workspaceRoots = collectWorkspaceRoots(api.config);
-  const allowedBaseDir =
-    pluginConfig.allowedBaseDir ||
-    path.join(path.dirname(workspaceRoots[0]), "workspace_guard/sandbox");
-  const protectedFiles = Array.isArray(pluginConfig.protectedFiles)
-    ? pluginConfig.protectedFiles
-    : DEFAULT_PROTECTED_FILES;
-
-  api.logger.info?.(
-    `workspace-guard active: protecting ${protectedFiles.length} patterns across ${workspaceRoots.length} workspaces, ` +
-      `group writes → ${allowedBaseDir}`,
-  );
-  for (const root of workspaceRoots) {
-    api.logger.info?.(`  workspace: ${root}`);
+function checkFileRead(params, workspaceRoots, protectedPatterns) {
+  const filePath = resolveFilePath(params);
+  const { absolutePath } = resolveAbsolute(filePath, workspaceRoots);
+  if (!absolutePath) return null;
+  if (isProtectedFile(absolutePath, workspaceRoots, protectedPatterns)) {
+    return { block: true, blockReason: "File not found." };
   }
-
-  api.on("before_tool_call", (event, ctx) => {
-    const toolName = (event.toolName || "").toLowerCase();
-
-    // Only intercept fs tools
-    if (!READ_TOOLS.has(toolName) && !WRITE_TOOLS.has(toolName) && toolName !== "apply_patch") {
-      return;
-    }
-
-    // Only enforce in group/channel sessions
-    if (!isProtectedSession(ctx.sessionKey)) return;
-
-    const filePath = resolveFilePath(event.params);
-    const { absolutePath, root } = resolveAbsoluteWithRoots(filePath, workspaceRoots);
-
-    // --- READ tools ---
-    if (READ_TOOLS.has(toolName)) {
-      if (!absolutePath) return;
-      if (isProtectedFile(absolutePath, workspaceRoots, protectedFiles)) {
-        const displayPath = root
-          ? path.relative(root, absolutePath)
-          : path.basename(absolutePath);
-        api.logger.warn?.(
-          `[workspace-guard] BLOCKED read of protected file: ${displayPath} (session: ${ctx.sessionKey})`,
-        );
-        return {
-          block: true,
-          blockReason: `🛡️ Protected file — cannot read "${displayPath}" in group chat context.`,
-        };
-      }
-      return;
-    }
-
-    // --- WRITE/EDIT tools ---
-    if (WRITE_TOOLS.has(toolName)) {
-      if (!absolutePath) return;
-
-      // Always block writes to protected files
-      if (isProtectedFile(absolutePath, workspaceRoots, protectedFiles)) {
-        const displayPath = root
-          ? path.relative(root, absolutePath)
-          : path.basename(absolutePath);
-        api.logger.warn?.(
-          `[workspace-guard] BLOCKED write to protected file: ${displayPath} (session: ${ctx.sessionKey})`,
-        );
-        return {
-          block: true,
-          blockReason: `🛡️ Protected file — cannot modify "${displayPath}" in group chat context.`,
-        };
-      }
-
-      // Redirect writes outside allowedBaseDir
-      const effectiveRoot = root || workspaceRoots[0];
-      const redirected = redirectPath(absolutePath, effectiveRoot, allowedBaseDir);
-      if (redirected) {
-        api.logger.info?.(
-          `[workspace-guard] Redirecting write: ${filePath} → ${redirected} (session: ${ctx.sessionKey})`,
-        );
-        return { params: rewriteParams(event.params, redirected) };
-      }
-
-      return;
-    }
-
-    // --- APPLY_PATCH ---
-    if (toolName === "apply_patch") {
-      // apply_patch embeds file paths inside patch content — we cannot reliably
-      // redirect paths without rewriting the patch format. Block entirely in
-      // external sessions. The AI should use write/edit instead (which get
-      // automatically redirected to the sandbox directory).
-      api.logger.warn?.(
-        `[workspace-guard] BLOCKED apply_patch in external session (session: ${ctx.sessionKey})`,
-      );
-      return {
-        block: true,
-        blockReason:
-          "🛡️ apply_patch is not available in external sessions. Use write or edit instead — files will be saved to the sandbox directory.",
-      };
-    }
-  });
+  return null;
 }
+
+function checkFileWrite(params, workspaceRoots, protectedPatterns, sandboxDir) {
+  const filePath = resolveFilePath(params);
+  const { absolutePath, root } = resolveAbsolute(filePath, workspaceRoots);
+  if (!absolutePath) return null;
+  if (isProtectedFile(absolutePath, workspaceRoots, protectedPatterns)) {
+    return { block: true, blockReason: "File not found." };
+  }
+  const effectiveRoot = root || workspaceRoots[0];
+  const redirected = redirectPath(absolutePath, effectiveRoot, sandboxDir);
+  if (redirected) {
+    return { params: rewriteParams(params, redirected) };
+  }
+  return null;
+}
+
+function checkExec(params, protectedLiterals, workspaceRoots, sandboxDir) {
+  const command = params?.command || "";
+  if (command) {
+    for (const literal of protectedLiterals) {
+      if (command.includes(literal)) {
+        return { block: true, blockReason: "Command references protected file." };
+      }
+    }
+    for (const pattern of SUSPICIOUS_EXEC_PATTERNS) {
+      if (pattern.test(command)) {
+        return { block: true, blockReason: "Command matches suspicious pattern." };
+      }
+    }
+  }
+  const workdir = params?.workdir;
+  if (workdir) {
+    for (const root of workspaceRoots) {
+      if (isPathInside(path.resolve(workdir), root)) {
+        return { params: { ...params, workdir: sandboxDir } };
+      }
+    }
+  }
+  return null;
+}
+
+// =============================================================================
+// Audit Logging
+// =============================================================================
+
+function logGuardAction(logger, action, toolName, sessionKey, reason) {
+  const level = action === "blocked" ? "warn" : "info";
+  logger[level]?.(
+    `[workspace-guard] ${action} | tool=${toolName} | session=${sessionKey} | reason=${reason || "n/a"}`,
+  );
+}
+
+// =============================================================================
+// Plugin Definition
+// =============================================================================
+
+export default {
+  id: "workspace-guard",
+  name: "OpenClaw Guard",
+  description:
+    "Protect workspace files from prompt injection. Default-deny tool policy for untrusted sessions with file path guards, exec scanning, and audit logging.",
+  version: "0.2.0",
+
+  register(api) {
+    const pluginConfig = api.pluginConfig || {};
+    const workspaceRoots = collectWorkspaceRoots(api.config);
+
+    // --- Config with defaults ---
+    const sandboxDir =
+      pluginConfig.sandboxDir ||
+      pluginConfig.allowedBaseDir || // backward compat
+      path.join(path.dirname(workspaceRoots[0]), "workspace_guard/sandbox");
+
+    const protectedPatterns = Array.isArray(pluginConfig.protectedFiles)
+      ? pluginConfig.protectedFiles
+      : DEFAULT_PROTECTED_FILES;
+
+    const trustedPatterns = Array.isArray(pluginConfig.trustedSessionPatterns)
+      ? pluginConfig.trustedSessionPatterns
+      : DEFAULT_TRUSTED_PATTERNS;
+
+    const untrustedAllowedTools = new Set(
+      Array.isArray(pluginConfig.untrustedToolAllowlist)
+        ? pluginConfig.untrustedToolAllowlist
+        : DEFAULT_UNTRUSTED_ALLOWED_TOOLS,
+    );
+
+    const execScanning = pluginConfig.execScanning !== false;
+    const auditLog = pluginConfig.auditLog !== false;
+
+    const protectedLiterals = Array.isArray(pluginConfig.protectedLiterals)
+      ? pluginConfig.protectedLiterals
+      : DEFAULT_PROTECTED_LITERALS;
+
+    // --- Startup log ---
+    api.logger.info?.(
+      `[workspace-guard] v0.2.0 | ` +
+        `${protectedPatterns.length} protected patterns | ` +
+        `${workspaceRoots.length} workspaces | ` +
+        `${untrustedAllowedTools.size} allowed tools (untrusted) | ` +
+        `sandbox: ${sandboxDir}`,
+    );
+
+    // --- Main guard hook ---
+    api.on(
+      "before_tool_call",
+      (event, ctx) => {
+        const toolName = (event.toolName || "").toLowerCase();
+        const trustLevel = getTrustLevel(ctx.sessionKey, trustedPatterns);
+
+        // Owner: unrestricted
+        if (trustLevel === "owner") return;
+
+        // =====================================================================
+        // UNTRUSTED sessions: default-deny with whitelist
+        // =====================================================================
+        if (trustLevel === "untrusted") {
+          // 1. Unconditionally safe tools
+          if (untrustedAllowedTools.has(toolName)) return;
+
+          // 2. File read: allow with path guard
+          if (FILE_READ_TOOLS.has(toolName)) {
+            const result = checkFileRead(event.params, workspaceRoots, protectedPatterns);
+            if (result) {
+              logGuardAction(api.logger, "blocked", toolName, ctx.sessionKey, result.blockReason);
+              return result;
+            }
+            return; // non-protected read is OK
+          }
+
+          // 3. File write/edit: allow with path guard + redirect
+          if (FILE_WRITE_TOOLS.has(toolName)) {
+            const result = checkFileWrite(event.params, workspaceRoots, protectedPatterns, sandboxDir);
+            if (result) {
+              logGuardAction(
+                api.logger,
+                result.block ? "blocked" : "redirected",
+                toolName,
+                ctx.sessionKey,
+                result.blockReason || "sandbox redirect",
+              );
+              return result;
+            }
+            return;
+          }
+
+          // 4. Exec: allow with command scanning
+          if (toolName === "exec" && execScanning) {
+            const result = checkExec(event.params, protectedLiterals, workspaceRoots, sandboxDir);
+            if (result) {
+              logGuardAction(
+                api.logger,
+                result.block ? "blocked" : "redirected",
+                toolName,
+                ctx.sessionKey,
+                result.blockReason || "workdir redirect",
+              );
+              return result;
+            }
+            return;
+          }
+
+          // 5. Implicit file tools: block
+          if (IMPLICIT_FILE_TOOLS.has(toolName)) {
+            logGuardAction(api.logger, "blocked", toolName, ctx.sessionKey, "implicit file tool");
+            return { block: true, blockReason: "Not available in this context." };
+          }
+
+          // 6. DEFAULT DENY — everything not whitelisted is blocked
+          logGuardAction(api.logger, "blocked", toolName, ctx.sessionKey, "not in allowlist");
+          return { block: true, blockReason: "Not available in this context." };
+        }
+
+        // =====================================================================
+        // TRUSTED sessions: file guards only, all tools allowed
+        // =====================================================================
+        if (trustLevel === "trusted") {
+          if (FILE_READ_TOOLS.has(toolName)) {
+            const result = checkFileRead(event.params, workspaceRoots, protectedPatterns);
+            if (result) {
+              logGuardAction(api.logger, "blocked", toolName, ctx.sessionKey, result.blockReason);
+              return result;
+            }
+            return;
+          }
+
+          if (FILE_WRITE_TOOLS.has(toolName)) {
+            const result = checkFileWrite(event.params, workspaceRoots, protectedPatterns, sandboxDir);
+            if (result) {
+              logGuardAction(
+                api.logger,
+                result.block ? "blocked" : "redirected",
+                toolName,
+                ctx.sessionKey,
+                result.blockReason || "sandbox redirect",
+              );
+              return result;
+            }
+            return;
+          }
+
+          if (toolName === "exec" && execScanning) {
+            const result = checkExec(event.params, protectedLiterals, workspaceRoots, sandboxDir);
+            if (result) {
+              logGuardAction(
+                api.logger,
+                result.block ? "blocked" : "redirected",
+                toolName,
+                ctx.sessionKey,
+                result.blockReason || "workdir redirect",
+              );
+              return result;
+            }
+            return;
+          }
+
+          if (IMPLICIT_FILE_TOOLS.has(toolName)) {
+            logGuardAction(api.logger, "blocked", toolName, ctx.sessionKey, "implicit file tool");
+            return { block: true, blockReason: "Not available in this context." };
+          }
+
+          // Trusted: all other tools allowed
+          return;
+        }
+      },
+      { priority: 100 },
+    );
+
+    // --- Audit hook ---
+    if (auditLog) {
+      api.on("after_tool_call", (event, ctx) => {
+        const trustLevel = getTrustLevel(ctx.sessionKey, trustedPatterns);
+        if (trustLevel === "owner") return;
+        api.logger.info?.(
+          `[guard-audit] ${trustLevel} | ${ctx.sessionKey} | ${event.toolName} | ` +
+            `${event.error ? "error" : "ok"} | ${event.durationMs ?? "?"}ms`,
+        );
+      });
+    }
+  },
+};

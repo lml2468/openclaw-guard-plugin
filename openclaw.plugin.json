@@ -1,20 +1,66 @@
 {
   "id": "workspace-guard",
   "name": "OpenClaw Guard",
-  "description": "Protect workspace files from prompt injection in external chat sessions. Blocks read/write/edit of protected files and redirects writes to a sandboxed directory.",
-  "version": "0.1.0",
+  "description": "Protect workspace files from prompt injection. Default-deny tool policy for untrusted sessions with file path guards, exec scanning, and audit logging.",
+  "version": "0.2.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "allowedBaseDir": {
-        "type": "string",
-        "description": "Base directory for external session file writes. Writes outside this directory are automatically redirected here."
-      },
       "protectedFiles": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "List of file patterns (relative to workspace root) that are always blocked in external sessions. Supports glob patterns via minimatch."
+        "description": "File patterns (relative to workspace root, minimatch glob) that are always blocked for read/write/edit.",
+        "default": [
+          "SOUL.md",
+          "AGENTS.md",
+          "USER.md",
+          "IDENTITY.md",
+          "MEMORY.md",
+          "TOOLS.md",
+          "HEARTBEAT.md",
+          "memory/*.md"
+        ]
+      },
+      "trustedSessionPatterns": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Minimatch patterns for trusted session keys. '*:main' maps to owner (unrestricted); other patterns map to trusted (file guards only, all tools allowed). Everything else is untrusted (default-deny).",
+        "default": ["*:main"]
+      },
+      "untrustedToolAllowlist": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Tools unconditionally allowed in untrusted sessions (no file/workspace access). Tools not in this list and not handled by specific guards are blocked.",
+        "default": ["web_search", "web_fetch", "tts", "message"]
+      },
+      "sandboxDir": {
+        "type": "string",
+        "description": "Directory where external session file writes are redirected. Defaults to <workspace_parent>/workspace_guard/sandbox."
+      },
+      "protectedLiterals": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "File name literals checked in exec commands. Defaults to base names of protectedFiles without globs.",
+        "default": [
+          "SOUL.md",
+          "AGENTS.md",
+          "USER.md",
+          "IDENTITY.md",
+          "MEMORY.md",
+          "TOOLS.md",
+          "HEARTBEAT.md"
+        ]
+      },
+      "execScanning": {
+        "type": "boolean",
+        "description": "Enable best-effort scanning of exec commands for references to protected files.",
+        "default": true
+      },
+      "auditLog": {
+        "type": "boolean",
+        "description": "Enable after_tool_call audit logging for all non-owner tool calls.",
+        "default": true
       }
     }
   }
